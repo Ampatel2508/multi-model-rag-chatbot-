@@ -1,0 +1,171 @@
+import logging
+import os
+from typing import List
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class DocumentProcessor:
+
+    def __init__(self):
+        """Initialize document processor."""
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=settings.CHUNK_SIZE,
+            chunk_overlap=settings.CHUNK_OVERLAP,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
+        logger.info("Document processor initialized")
+    
+    def process_document(self, file_path: str, filename: str, file_ext: str) -> List[Document]:
+
+        logger.info(f"Processing document: {filename} ({file_ext})")
+        
+        # Extract text based on file type
+        if file_ext == ".pdf":
+            text = self._extract_from_pdf(file_path)
+        elif file_ext in [".docx", ".doc"]:
+            text = self._extract_from_docx(file_path)
+        elif file_ext in [".xlsx", ".xls"]:
+            text = self._extract_from_excel(file_path)
+        elif file_ext == ".csv":
+            text = self._extract_from_csv(file_path)
+        elif file_ext == ".txt":
+            text = self._extract_from_txt(file_path)
+        elif file_ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"]:
+            text = self._extract_from_image(file_path)
+        else:
+            raise ValueError(f"Unsupported file type: {file_ext}")
+        
+        if not text or not text.strip():
+            raise ValueError(f"No text extracted from {filename}")
+        
+        # Create a single document
+        doc = Document(
+            page_content=text,
+            metadata={
+                "filename": filename,
+                "file_type": file_ext,
+                "source": file_path
+            }
+        )
+        
+        # Split into chunks
+        chunks = self.text_splitter.split_documents([doc])
+        
+        logger.info(f"✓ Created {len(chunks)} chunks from {filename}")
+        return chunks
+    
+    def _extract_from_pdf(self, file_path: str) -> str:
+        """Extract text from PDF."""
+        try:
+            from pypdf import PdfReader
+            
+            reader = PdfReader(file_path)
+            text_parts = []
+            
+            for page_num, page in enumerate(reader.pages, 1):
+                text = page.extract_text()
+                if text:
+                    text_parts.append(f"[Page {page_num}]\n{text}")
+            
+            return "\n\n".join(text_parts)
+        except Exception as e:
+            logger.error(f"Error extracting from PDF: {e}")
+            raise ValueError(f"Failed to extract text from PDF: {str(e)}")
+    
+    def _extract_from_docx(self, file_path: str) -> str:
+        """Extract text from DOCX."""
+        try:
+            from docx import Document as DocxDocument
+            
+            doc = DocxDocument(file_path)
+            text_parts = []
+            
+            for para in doc.paragraphs:
+                if para.text.strip():
+                    text_parts.append(para.text)
+            
+            # Also extract from tables
+            for table in doc.tables:
+                for row in table.rows:
+                    row_text = " | ".join(cell.text for cell in row.cells)
+                    if row_text.strip():
+                        text_parts.append(row_text)
+            
+            return "\n\n".join(text_parts)
+        except Exception as e:
+            logger.error(f"Error extracting from DOCX: {e}")
+            raise ValueError(f"Failed to extract text from DOCX: {str(e)}")
+    
+    def _extract_from_excel(self, file_path: str) -> str:
+        """Extract text from Excel."""
+        try:
+            import openpyxl
+            
+            wb = openpyxl.load_workbook(file_path)
+            text_parts = []
+            
+            for sheet_name in wb.sheetnames:
+                sheet = wb[sheet_name]
+                text_parts.append(f"[Sheet: {sheet_name}]")
+                
+                for row in sheet.iter_rows(values_only=True):
+                    row_text = " | ".join(str(cell) if cell is not None else "" for cell in row)
+                    if row_text.strip():
+                        text_parts.append(row_text)
+            
+            return "\n".join(text_parts)
+        except Exception as e:
+            logger.error(f"Error extracting from Excel: {e}")
+            raise ValueError(f"Failed to extract text from Excel: {str(e)}")
+    
+    def _extract_from_csv(self, file_path: str) -> str:
+        """Extract text from CSV."""
+        try:
+            import csv
+            
+            text_parts = []
+            
+            with open(file_path, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    row_text = " | ".join(row)
+                    if row_text.strip():
+                        text_parts.append(row_text)
+            
+            return "\n".join(text_parts)
+        except Exception as e:
+            logger.error(f"Error extracting from CSV: {e}")
+            raise ValueError(f"Failed to extract text from CSV: {str(e)}")
+    
+    def _extract_from_txt(self, file_path: str) -> str:
+        """Extract text from TXT."""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except Exception as e:
+            logger.error(f"Error extracting from TXT: {e}")
+            raise ValueError(f"Failed to extract text from TXT: {str(e)}")
+    
+    def _extract_from_image(self, file_path: str) -> str:
+        """Extract text from image using OCR."""
+        try:
+            from PIL import Image
+            import pytesseract
+            
+            image = Image.open(file_path)
+            text = pytesseract.image_to_string(image)
+            
+            if not text.strip():
+                raise ValueError("No text found in image")
+            
+            return text
+        except ImportError:
+            logger.error("pytesseract not installed. Please install tesseract-ocr")
+            raise ValueError("OCR is not available. Please install tesseract-ocr on your system.")
+        except Exception as e:
+            logger.error(f"Error extracting from image: {e}")
+            raise ValueError(f"Failed to extract text from image: {str(e)}")
