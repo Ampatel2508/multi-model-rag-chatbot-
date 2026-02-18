@@ -6,7 +6,7 @@ FastAPI Backend for Multi-Model RAG Chatbot
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
-from fastapi import FastAPI, HTTPException, status, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, status, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from datetime import datetime
@@ -24,6 +24,9 @@ from app.document_processor import DocumentProcessor
 from app.rag_engine import RAGEngine
 from app.content_moderator import ContentModerator
 from app.memory_manager import get_memory_manager
+from app.chat_db import save_session, save_message, get_sessions, get_messages, delete_session, get_last_user_context
+from app.calendar_service import CalendarService
+from app.calendar_mcp_server import _schedule_meeting_impl
 
 # Setup logging
 logging.basicConfig(
@@ -50,13 +53,50 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Include calendar routes
+from app.calendar_routes import router as calendar_router
+app.include_router(calendar_router)
+
 # Global instances
 document_processor = DocumentProcessor()
 rag_engine = RAGEngine()
 content_moderator = ContentModerator()
 memory_manager = get_memory_manager()
+calendar_service = CalendarService()  # Initialize calendar service
 
 logger.info("FastAPI app created successfully")
+
+
+def _extract_title_from_message(message: str) -> str:
+    """Extract a title from calendar request message"""
+    # Try to find patterns like "schedule X" or "meet with X"
+    message_lower = message.lower()
+    
+    # Common patterns
+    patterns = [
+        ("schedule ", "with "),
+        ("meeting with ", None),
+        ("meet ", None),
+        ("call with ", None),
+        ("book ", "for"),
+    ]
+    
+    for start_pattern, end_pattern in patterns:
+        if start_pattern in message_lower:
+            start_idx = message_lower.index(start_pattern) + len(start_pattern)
+            
+            if end_pattern:
+                if end_pattern in message_lower[start_idx:]:
+                    end_idx = message_lower.index(end_pattern, start_idx)
+                    return message[start_idx:end_idx].strip()
+            else:
+                # Take next few words
+                words = message[start_idx:].split()[:3]
+                return " ".join(words).strip()
+    
+    # Fallback: use first few words
+    words = message.split()[:3]
+    return " ".join(words) if words else "Meeting"
 
 
 @app.on_event("startup")
@@ -224,6 +264,11 @@ async def chat(request: ChatRequest):
     logger.info(f"Question: {request.question[:100]}...")
     logger.info(f"Provider: {request.provider}, Model: {request.model}")
     logger.info(f"Document IDs: {request.document_ids}")
+    if request.conversation_history:
+        logger.info(f"Conversation history provided: {len(request.conversation_history)} messages")
+        logger.info(f"History preview: {request.conversation_history[:2]}")
+    else:
+        logger.info("No conversation history provided")
     
     try:
         # Validate API key is provided first (needed for LLM initialization)
@@ -278,6 +323,50 @@ async def chat(request: ChatRequest):
         
         logger.info("[✓] Content passed moderation check")
         
+        # Check if this is a calendar scheduling request
+        calendar_keywords = ['schedule', 'meeting', 'calendar', 'event', 'book', 'set up', 'create', 'appointment', 'call', 'standup', 'sync']
+        question_lower = request.question.lower()
+        is_calendar_request = any(keyword in question_lower for keyword in calendar_keywords)
+        
+        if is_calendar_request:
+            logger.info(f"[*] Calendar request detected in message")
+            try:
+                # Try to schedule a meeting
+                calendar_response = _schedule_meeting_impl(
+                    title=_extract_title_from_message(request.question),
+                    datetime_text=request.question
+                )
+                
+                logger.info(f"[✓] Calendar request processed: {str(calendar_response)[:100]}...")
+                
+                # Extract the message from the response (success or error)
+                answer_text = calendar_response.get("message", "✅ Meeting scheduled successfully!")
+                
+                sources = []  # No sources for calendar responses
+                response = ChatResponse(
+                    answer=answer_text,
+                    sources=sources,
+                    session_id=request.session_id,
+                    model_used="calendar-mcp",
+                    provider_used="google-calendar"
+                )
+                logger.info("=" * 60)
+                return response
+                
+            except Exception as e:
+                logger.error(f"[!] Unexpected error during calendar processing: {str(e)}")
+                # Return error response instead of falling back
+                sources = []
+                response = ChatResponse(
+                    answer=f"❌ I encountered an issue scheduling the meeting: {str(e)}",
+                    sources=sources,
+                    session_id=request.session_id,
+                    model_used="calendar-mcp",
+                    provider_used="google-calendar"
+                )
+                logger.info("=" * 60)
+                return response
+        
         # Validate document IDs if provided
         if request.document_ids:
             available_docs = rag_engine.list_documents()
@@ -294,7 +383,24 @@ async def chat(request: ChatRequest):
                     }
                 )
         
-        # Get answer from RAG engine
+        # Get user context from previous sessions (universal context)
+        user_context = {}
+        if request.user_id:
+            logger.info(f"[DEBUG] Retrieving context for user_id: {request.user_id}")
+            user_context = get_last_user_context(request.user_id)
+            logger.info(f"[DEBUG] get_last_user_context returned type: {type(user_context)}, keys: {user_context.keys() if isinstance(user_context, dict) else 'N/A'}")
+            if user_context:
+                logger.info(f"[*] Universal user context from previous chats retrieved")
+                if user_context.get("previous_context"):
+                    prev_context = user_context['previous_context']
+                    logger.info(f"[DEBUG] Previous context length: {len(prev_context)} characters")
+                    logger.info(f"[DEBUG] Previous context preview: {prev_context[:200]}...")
+                else:
+                    logger.info(f"[DEBUG] user_context exists but no 'previous_context' key")
+            else:
+                logger.info(f"[DEBUG] get_last_user_context returned empty/None")
+
+        # Get answer from RAG engine, pass user_context and conversation history
         result = rag_engine.ask(
             question=request.question,
             provider=request.provider,
@@ -302,14 +408,17 @@ async def chat(request: ChatRequest):
             api_key=request.api_key,
             document_ids=request.document_ids,
             url=request.url,
-            session_id=request.session_id
+            session_id=request.session_id,
+            conversation_history=request.conversation_history,
+            user_context=user_context
         )
-        
+
         # Convert sources to Source models
         sources = [Source(**source) for source in result["sources"]]
-        
+        answer_text = result["answer"]
+
         response = ChatResponse(
-            answer=result["answer"],
+            answer=answer_text,
             sources=sources,
             session_id=request.session_id,
             model_used=result["model"],
@@ -327,6 +436,35 @@ async def chat(request: ChatRequest):
             logger.info(f"[✓] Message saved to memory")
         except Exception as e:
             logger.warning(f"Failed to save message to memory: {e}")
+        
+        # Save message to persistent session storage (DB)
+        try:
+            if request.user_id and request.session_id:
+                logger.info(f"[*] Saving to persistent storage for session: {request.session_id}")
+                save_session(request.user_id, request.session_id)
+                # Save user message
+                save_message(
+                    user_id=request.user_id,
+                    session_id=request.session_id,
+                    role="user",
+                    content=request.question,
+                    provider=request.provider,
+                    model=request.model,
+                    metadata=str([{ "filename": s.filename, "page": s.page } for s in sources])
+                )
+                # Save AI response
+                save_message(
+                    user_id=request.user_id,
+                    session_id=request.session_id,
+                    role="assistant",
+                    content=answer_text,
+                    provider=request.provider,
+                    model=request.model,
+                    metadata=str([{ "filename": s.filename, "page": s.page } for s in sources])
+                )
+                logger.info(f"[✓] Message saved to persistent storage (DB)")
+        except Exception as e:
+            logger.warning(f"Failed to save to persistent storage (DB): {e}")
         
         logger.info(f"✓ Successfully generated answer with {len(sources)} sources")
         logger.info("=" * 60)
@@ -576,6 +714,165 @@ async def clear_all_memory():
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to clear all sessions: {str(e)}"
+        )
+
+
+# ============================================================================
+# Chat Sessions API - Persistent chat history management
+# ============================================================================
+# Chat Sessions API - Persistent chat history management
+# ============================================================================
+
+
+@app.get("/api/chat-sessions/{user_id}")
+async def get_user_sessions(user_id: str):
+    """
+    Get all chat sessions for a user from persistent DB.
+    """
+    logger.info(f"[Sessions] Fetching sessions for user: {user_id}")
+    try:
+        sessions = get_sessions(user_id)
+        for idx, s in enumerate(sessions):
+            s["session_name"] = f"Chat {idx+1}"
+            s["message_count"] = len(get_messages(s["id"]))
+        logger.info(f"[Sessions] Found {len(sessions)} sessions for user {user_id}")
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "sessions": sessions,
+            "count": len(sessions)
+        }
+    except Exception as e:
+        logger.error(f"Error fetching sessions for user {user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch sessions: {str(e)}"
+        )
+
+
+
+@app.get("/api/chat-sessions/{user_id}/{session_id}")
+async def get_session_details(user_id: str, session_id: str):
+    """
+    Get detailed information about a specific chat session from persistent DB.
+    """
+    logger.info(f"[Sessions] Fetching details for session {session_id} of user {user_id}")
+    try:
+        sessions = get_sessions(user_id)
+        session = next((s for s in sessions if s["id"] == session_id), None)
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session {session_id} not found"
+            )
+        messages = get_messages(session_id)
+        
+        # Convert database format to frontend format
+        # Pair user and assistant messages together
+        formatted_messages = []
+        i = 0
+        while i < len(messages):
+            if i < len(messages) - 1 and messages[i]["role"] == "user" and messages[i+1]["role"] == "assistant":
+                formatted_messages.append({
+                    "id": messages[i]["id"],
+                    "user_message": messages[i]["content"],
+                    "ai_response": messages[i+1]["content"],
+                    "provider": messages[i+1].get("provider"),
+                    "model": messages[i+1].get("model"),
+                    "created_at": messages[i]["timestamp"],
+                    "timestamp": messages[i]["timestamp"]
+                })
+                i += 2
+            else:
+                i += 1
+        
+        return {
+            "status": "success",
+            "id": session_id,
+            "session_name": "Chat",
+            "created_at": session["created_at"],
+            "updated_at": session["updated_at"],
+            "messages": formatted_messages,
+            "message_count": len(formatted_messages)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching session details: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch session details: {str(e)}"
+        )
+
+
+
+@app.post("/api/chat-sessions/{user_id}/{session_id}")
+async def save_session_message(user_id: str, session_id: str, request: Request):
+    """
+    Save a message to a chat session in persistent DB.
+    """
+    logger.info(f"[Sessions] Saving message to session {session_id} for user {user_id}")
+    try:
+        request_body = await request.json()
+        save_session(user_id, session_id)
+        save_message(
+            user_id=user_id,
+            session_id=session_id,
+            role=request_body.get("role", "user"),
+            content=request_body.get("user_message"),
+            provider=request_body.get("provider"),
+            model=request_body.get("model"),
+            metadata=str(request_body.get("sources", {}))
+        )
+        save_message(
+            user_id=user_id,
+            session_id=session_id,
+            role="assistant",
+            content=request_body.get("ai_response"),
+            provider=request_body.get("provider"),
+            model=request_body.get("model"),
+            metadata=str(request_body.get("sources", {}))
+        )
+        logger.info(f"[Sessions] Message saved to session {session_id}")
+        return {
+            "status": "success",
+            "session_id": session_id
+        }
+    except Exception as e:
+        logger.error(f"Error saving message: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save message: {str(e)}"
+        )
+
+
+
+@app.delete("/api/chat-sessions/{user_id}/{session_id}")
+async def delete_session_api(user_id: str, session_id: str):
+    """
+    Delete a chat session from persistent DB.
+    """
+    logger.info(f"[Sessions] Deleting session {session_id} for user {user_id}")
+    try:
+        sessions = get_sessions(user_id)
+        if not any(s["id"] == session_id for s in sessions):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session {session_id} not found"
+            )
+        delete_session(session_id)
+        logger.info(f"[Sessions] Session {session_id} deleted")
+        return {
+            "status": "success",
+            "message": f"Session {session_id} deleted"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting session: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete session: {str(e)}"
         )
 
 

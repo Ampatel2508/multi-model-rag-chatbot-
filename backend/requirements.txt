@@ -29,13 +29,14 @@ langchain-groq==0.0.1
 groq==0.4.1
 
 # Vector store and embeddings
-faiss-cpu==1.7.4
+faiss-cpu==1.13.1
 sentence-transformers==2.2.2
 
 # Web scraping
 requests==2.31.0
 beautifulsoup4==4.12.2
 lxml==4.9.3
+playwright==1.58.0
 
 # PDF handling and OCR
 PyPDF2==3.0.1
@@ -47,6 +48,18 @@ opencv-python==4.8.1.78
 # Utilities
 numpy==1.24.3
 typing-extensions==4.9.0
+
+# MCP Server
+mcp==0.1.0
+
+# Google Calendar
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0
+google-api-python-client==2.108.0
+
+# Date parsing
+python-dateutil==2.8.2
+arrow==1.3.0
 
 # Content Moderation
 detoxify==0.5.1

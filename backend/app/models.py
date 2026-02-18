@@ -29,11 +29,13 @@ class ChatRequest(BaseModel):
     """Request model for chat endpoint."""
     question: str = Field(..., min_length=1, max_length=2000, description="User's question")
     session_id: Optional[str] = Field(None, description="Optional session ID for conversation tracking")
+    user_id: Optional[str] = Field(None, description="Optional user ID for context carry-over")
     provider: str = Field(..., description="AI provider (gemini, openrouter, groq)")
     model: str = Field(..., description="Model name to use")
     api_key: str = Field(..., description="API key for the provider")
     document_ids: Optional[List[str]] = Field(default=[], description="List of uploaded document IDs to use as context")
     url: Optional[str] = Field(None, description="URL to fetch content from for RAG context")
+    conversation_history: Optional[List[dict]] = Field(default=[], description="Previous messages in the conversation for context")
 
     @field_validator('provider')
     @classmethod

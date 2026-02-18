@@ -20,6 +20,23 @@ class Settings:
         cors_origins_str = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000")
         self.CORS_ORIGINS: List[str] = [origin.strip() for origin in cors_origins_str.split(",")]
 
+        # Database Configuration
+        # Default to SQLite database in the backend directory
+        # Support both relative and absolute paths from .env
+        db_url = os.getenv("DATABASE_URL", "sqlite:///chatbot.db")
+        
+        # If relative path (sqlite:///chatbot.db), convert to absolute
+        if "sqlite:///" in db_url and not db_url.startswith("sqlite:////"):
+            # Extract the relative path
+            relative_path = db_url.replace("sqlite:///", "")
+            # Get absolute backend directory
+            backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            abs_path = os.path.join(backend_dir, relative_path)
+            # Create proper SQLite URL with forward slashes
+            self.DATABASE_URL: str = f"sqlite:///{abs_path.replace(chr(92), '/')}"
+        else:
+            self.DATABASE_URL: str = db_url
+
         # Upload Configuration
         self.UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "uploads")
         self.MAX_FILE_SIZE: int = int(os.getenv("MAX_FILE_SIZE", "10485760"))  # 10MB
